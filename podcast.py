@@ -7,8 +7,25 @@ from pydub import AudioSegment
 import shutil
 import re
 import traceback # Per loggare errori dettagliati
+import platform
+import subprocess
 
 # --- Configurazione ---
+
+# Verifica la disponibilità di FFmpeg nel sistema
+def check_ffmpeg():
+    """Verifica che FFmpeg sia installato e disponibile nel sistema."""
+    try:
+        # Esegue un comando FFmpeg minimo per verificare la presenza
+        subprocess.run(
+            ["ffmpeg", "-version"], 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE, 
+            check=True
+        )
+        return True
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return False
 
 # Lista di voci italiane disponibili in edge-tts
 ITALIAN_VOICES = [
@@ -163,8 +180,14 @@ async def create_podcast_core_logic(script_text, voice_assignments=None):
     print(f"Voci assegnate: {assigned_voices}")
 
     # 3. Generazione Segmenti Audio (in directory temporanea)
-    # Usiamo una directory temporanea che Streamlit dovrebbe poter gestire/pulire
-    temp_dir = tempfile.mkdtemp(prefix="podcast_streamlit_")
+    # In Streamlit Cloud, dobbiamo usare una directory in cui abbiamo sicuramente permessi di scrittura
+    if os.environ.get("STREAMLIT_SHARING") or os.environ.get("STREAMLIT_CLOUD"):
+        # Su Streamlit Cloud usiamo /tmp che è garantito scrivibile
+        temp_dir = tempfile.mkdtemp(dir="/tmp", prefix="podcast_streamlit_")
+    else:
+        # Altrimenti usiamo la directory temporanea standard del sistema
+        temp_dir = tempfile.mkdtemp(prefix="podcast_streamlit_")
+    
     print(f"Directory temporanea creata: {temp_dir}")
     segment_files_paths = []
     tasks = []
@@ -190,16 +213,37 @@ async def create_podcast_core_logic(script_text, voice_assignments=None):
         combined_audio = AudioSegment.empty()
         silence = AudioSegment.silent(duration=SILENCE_BETWEEN_SEGMENTS_MS) if SILENCE_BETWEEN_SEGMENTS_MS > 0 else None
 
+        # Verifica che FFmpeg sia disponibile (richiesto da pydub)
+        if not check_ffmpeg():
+            st.error("❌ FFmpeg non è disponibile nel sistema. È necessario per elaborare i file audio.")
+            print("ERRORE: FFmpeg non è disponibile. Pydub richiede FFmpeg per funzionare.")
+            raise RuntimeError("FFmpeg non è disponibile nel sistema. Installalo o usa un ambiente che lo supporti.")
+        
+        segments_loaded = 0
         for i, audio_file in enumerate(valid_segment_files):
             try:
+                # Verifica che il file sia accessibile e non vuoto
+                if not os.path.exists(audio_file) or os.path.getsize(audio_file) == 0:
+                    print(f"File audio non valido: {audio_file}")
+                    continue
+                
+                print(f"Caricamento segmento audio: {audio_file} ({os.path.getsize(audio_file)} bytes)")
                 segment_audio = AudioSegment.from_mp3(audio_file)
-                combined_audio += segment_audio
-                if silence and i < len(valid_segment_files) - 1:
-                    combined_audio += silence
+                
+                # Verifica che il segmento audio non sia vuoto
+                if len(segment_audio) > 0:
+                    combined_audio += segment_audio
+                    segments_loaded += 1
+                    if silence and i < len(valid_segment_files) - 1:
+                        combined_audio += silence
+                else:
+                    print(f"Segmento audio vuoto: {audio_file}")
             except Exception as e:
                 print(f"Errore nel caricare o aggiungere il segmento {audio_file}: {e}. Segmento saltato.")
+                traceback.print_exc()  # Stampa traceback dettagliato per debug
 
-        if len(combined_audio) == 0:
+        if len(combined_audio) == 0 or segments_loaded == 0:
+            print(f"Nessun segmento audio valido trovato tra {len(valid_segment_files)} file.")
             raise RuntimeError("Errore durante la combinazione dei segmenti audio. Il podcast finale è vuoto.")
 
         # 5. Esportazione File Finale
